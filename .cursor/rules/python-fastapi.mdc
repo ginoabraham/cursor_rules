@@ -1,0 +1,216 @@
+---
+description: FastAPI, SQLAlchemy 2.0 async, asyncpg, and Alembic standards for Python web services and persistence. Apply when building HTTP APIs, route handlers, ORM entities, repositories, Unit of Work implementations, or database migrations. Extends the core `python` rule.
+alwaysApply: false
+---
+# Python Web Service & Persistence Guidelines
+
+Extends the core `python` rule; everything there still applies.
+
+## 1. API Design (Presentation)
+- FastAPI with explicit request/response models; never return ORM entities or Domain models directly.
+- Version APIs (`/api/v1/...`), use consistent pagination, and keep OpenAPI docs accurate.
+- Keep route handlers thin: validate input, map to an Application Command, call the service, map the result.
+- Declare dependencies as `Annotated[T, Depends(...)]`; never use `Depends` as a default argument value.
+- Request bodies: `ConfigDict(frozen=True, extra="forbid")` without model-level `strict=True` (FastAPI validates the parsed JSON in Python mode, so strict rejects string `UUID`/`datetime`/`Decimal`). Apply `Field(strict=True)` to individual primitive fields instead.
+- Install `fastapi`, not `fastapi[standard]` (pulls `httpx` -> `certifi`, MPL-2.0).
+
+## 2. Composition & Errors
+- Build the app in a `create_app(settings)` factory. Create the engine and session factory in the `lifespan` handler and dispose of them on shutdown.
+- Annotate `lifespan` and generator dependencies with `AsyncGenerator[T]`, not `AsyncIterator[T]`.
+- Map `DomainError` subclasses to HTTP status codes in one exception handler, returning RFC 9457 Problem Details (`application/problem+json`).
+
+## 3. Database & Migrations
+- SQLAlchemy 2.0 async style with typed `Mapped[...]` columns.
+- Postgres driver: `asyncpg` (Apache-2.0). Do not use `psycopg2` or `psycopg` 3; both are LGPL-licensed.
+- One `AsyncSession` per request, owned by the Unit of Work. Never share a session across concurrent tasks.
+- Use `async_sessionmaker(engine, expire_on_commit=False)` and enable `pool_pre_ping=True`.
+- All schema changes go through Alembic migrations.
+
+## Example Output Standard
+
+`src/app/customers/infrastructure.py`:
+```python
+from types import TracebackType
+from typing import Self, override
+from uuid import UUID
+
+from sqlalchemy import String
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from app.customers.domain import Customer, CustomerId
+from app.customers.services import CustomerRepository, UnitOfWork
+
+
+class Base(DeclarativeBase):
+    """Declarative base for ORM entities."""
+
+
+class CustomerEntity(Base):
+    """ORM entity for the `customers` table."""
+
+    __tablename__ = "customers"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True)
+    age: Mapped[int]
+
+
+class SqlCustomerRepository(CustomerRepository):
+    """SQLAlchemy-backed customer repository."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    @override
+    async def get_by_id(self, customer_id: CustomerId) -> Customer | None:
+        entity = await self._session.get(CustomerEntity, customer_id)
+        if entity is None:
+            return None
+        return Customer(id=entity.id, email=entity.email, age=entity.age)
+
+    @override
+    async def add(self, customer: Customer) -> None:
+        entity = CustomerEntity(id=customer.id, email=customer.email, age=customer.age)
+        self._session.add(entity)
+
+
+class SqlUnitOfWork(UnitOfWork):
+    """Unit of Work bound to one `AsyncSession`; rolls back unless committed."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+        self._customers = SqlCustomerRepository(session)
+
+    @property
+    @override
+    def customers(self) -> CustomerRepository:
+        return self._customers
+
+    @override
+    async def __aenter__(self) -> Self:
+        return self
+
+    @override
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self._session.rollback()
+
+    @override
+    async def commit(self) -> None:
+        await self._session.commit()
+```
+
+`src/app/customers/api.py`:
+```python
+from collections.abc import AsyncGenerator
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Request, status
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.customers.infrastructure import SqlUnitOfWork
+from app.customers.services import CustomerService, RegisterCustomerCommand
+
+
+class RegisterCustomerRequest(BaseModel):
+    """Request body for registering a customer."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    email: EmailStr = Field(max_length=255)
+    age: int = Field(ge=18, strict=True)
+
+
+class CustomerCreatedResponse(BaseModel):
+    """Response body for a newly registered customer."""
+
+    id: UUID
+
+
+async def get_session(request: Request) -> AsyncGenerator[AsyncSession]:
+    """Yield a request-scoped database session."""
+    session_factory: async_sessionmaker[AsyncSession] = (
+        request.app.state.session_factory
+    )
+    async with session_factory() as session:
+        yield session
+
+
+def get_customer_service(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> CustomerService:
+    """Build a `CustomerService` for the current request."""
+    return CustomerService(SqlUnitOfWork(session))
+
+
+router = APIRouter(prefix="/api/v1/customers", tags=["customers"])
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def register_customer(
+    body: RegisterCustomerRequest,
+    service: Annotated[CustomerService, Depends(get_customer_service)],
+) -> CustomerCreatedResponse:
+    """Register a new customer."""
+    command = RegisterCustomerCommand(email=body.email, age=body.age)
+    customer_id = await service.register(command)
+    return CustomerCreatedResponse(id=customer_id)
+```
+
+`src/app/main.py`:
+```python
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from http import HTTPStatus
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from app.config import Settings
+from app.customers.api import router as customers_router
+from app.customers.domain import CustomerRestrictedError, DomainError
+
+
+def create_app(settings: Settings) -> FastAPI:
+    """Composition root: wire infrastructure, routers, and error handlers."""
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+        database_url = settings.database_url.get_secret_value()
+        engine = create_async_engine(database_url, pool_size=10, pool_pre_ping=True)
+        app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        yield
+        await engine.dispose()
+
+    app = FastAPI(lifespan=lifespan)
+    app.include_router(customers_router)
+
+    @app.exception_handler(DomainError)
+    async def handle_domain_error(request: Request, exc: DomainError) -> JSONResponse:
+        match exc:
+            case CustomerRestrictedError():
+                status_code = HTTPStatus.UNPROCESSABLE_CONTENT
+            case _:
+                status_code = HTTPStatus.BAD_REQUEST
+
+        problem = {
+            "type": "about:blank",
+            "title": status_code.phrase,
+            "status": status_code.value,
+            "detail": str(exc),
+            "instance": request.url.path,
+        }
+        return JSONResponse(
+            problem, status_code=status_code, media_type="application/problem+json"
+        )
+
+    return app
+```

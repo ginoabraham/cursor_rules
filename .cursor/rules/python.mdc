@@ -1,53 +1,56 @@
 ---
 description: Enterprise Python 3.14+ standards, Pydantic v2, Clean Architecture/DDD, and strict permissive-only licensing.
-globs: ["**/*.py", "**/pyproject.toml"]
+globs: **/*.py, **/pyproject.toml
 alwaysApply: false
 ---
 # Enterprise Python Coding Guidelines
 
 You are an expert Python software architect writing modern Python (3.14+) to strict enterprise architectural standards. Write code that is fully typed, modular, secure, observable, and built for scale. When a rule conflicts with existing project conventions, follow the project and point out the conflict.
 
+For FastAPI, SQLAlchemy, asyncpg, or Alembic work, also apply the `python-fastapi` rule.
+
 ## 0. Baseline
 - Target Python 3.14 or newer: `requires-python = ">=3.14"` in `pyproject.toml`.
 - Use the `src/` layout with a single `pyproject.toml` as the source of truth for dependencies and tool config.
-- Python 3.14+ free-threaded (No-GIL) builds should be utilized for CPU-bound workloads, provided all C-extension dependencies (like `asyncpg` and `pydantic-core`) are verified to support it.
+- Python 3.14+ free-threaded (No-GIL) builds should be utilized for CPU-bound workloads, provided all C-extension dependencies are verified to support it.
 
 ## 1. Architecture & Domain-Driven Design
 - **Clean Architecture:** Layers are Domain, Application, Infrastructure, Presentation. Dependencies point inward only. Domain never imports ORMs, web frameworks, or I/O libraries.
 - **Feature-based structure:** Organize by feature (`src/app/billing/domain.py`, `src/app/billing/services.py`), not by type (`models/`, `services/`).
 - **Interfaces:** Define contracts using `typing.Protocol` (structural subtyping). Inject dependencies via constructor (`__init__`); never instantiate dependencies inside business logic.
-- **Composition root:** Wire dependencies in one place at startup (e.g., FastAPI lifespan / dependency providers). No service locators or global singletons.
-- **Repository & Unit of Work:** Repositories abstract persistence and return Domain models. Unit of Work owns transaction and session boundaries.
+- **Composition root:** Wire dependencies in one place at startup (e.g., `main()` or the framework's startup hook). No service locators or global singletons.
+- **Repository & Unit of Work:** Repositories abstract persistence and return Domain models. Unit of Work owns transaction and session boundaries; Application services commit through it.
 - **CQRS:** Separate Commands (writes) from Queries (reads) with explicit DTOs.
-- **Model separation:** Pydantic DTOs at API boundaries, `@dataclass(frozen=True, slots=True)` domain models, SQLAlchemy entities in Infrastructure. Map explicitly between them.
+- **Model separation:** Pydantic DTOs at boundaries; Domain models and Value Objects are `@dataclass(frozen=True, slots=True)`; persistence entities live in Infrastructure. Map explicitly between them.
 
 ## 2. Pydantic v2
 - v2 APIs only: `.model_dump()`, `.model_validate()`, `.model_validate_json()`, `@field_validator`, `@model_validator`. Never `.dict()`, `.parse_obj()`, or `@validator`.
 - Enforce contracts with `Field` constraints (`min_length`, `max_length`, `ge`, `le`, `pattern`) and `Annotated` types.
-- Use built-in types where available: `EmailStr`, `HttpUrl`, `UUID4`, `PositiveInt`, `SecretStr`.
+- Use built-in types where available: `EmailStr`, `HttpUrl`, `PositiveInt`, `SecretStr`. Use plain `UUID` for IDs (`UUID4` rejects `uuid7()` values).
 - `@field_validator` for single-field rules; `@model_validator(mode="after")` for cross-field rules. Raise `ValueError` or domain exceptions.
-- Inbound DTOs and Value Objects: `model_config = ConfigDict(frozen=True, strict=True, extra="forbid")` for absolute immutability.
+- Internal Commands, Queries, and messages: `model_config = ConfigDict(frozen=True, strict=True, extra="forbid")`. Strict mode rejects string-encoded `UUID`/`datetime`/`Decimal` in Python-mode validation, so HTTP request bodies follow the `python-fastapi` rule instead.
 - Use `TypeAdapter` to validate non-model types; reuse adapters, don't rebuild them in hot paths.
 
 ## 3. Modern Python Features
-- **Generics and Aliases (PEP 695):** `type UserId = UUID`, `def first[T](items: Sequence[T]) -> T:`. Do not use `TypeVar` or `TypeAlias` for new code.
+- **Generics and Aliases (PEP 695):** `type UserId = UUID`, `def first[T](items: Sequence[T]) -> T:`. Do not use `TypeVar` or `TypeAlias` for new code, and only add type parameters when they relate two or more types.
+- **Annotations:** Python 3.14 defers annotation evaluation; do not add `from __future__ import annotations`.
 - **Pattern matching:** Use `match`/`case` for unions, command dispatch, and complex branching.
-- **Concurrency:** Use `asyncio.TaskGroup` over `asyncio.gather`; handle grouped failures with `except*`.
-- **Overrides:** Mark overriding methods with `@typing.override` (PEP 698), enforced by the type checker.
+- **Concurrency:** Use `asyncio.TaskGroup` over `asyncio.gather` for independent I/O; handle grouped failures with `except*`. Never share one DB session/connection across concurrent tasks.
+- **Overrides:** Mark overriding methods with `@typing.override` (PEP 698). Implementations that use `@override` must explicitly subclass the Protocol or base class.
 - **Enums:** Use `enum.StrEnum` / `IntEnum` instead of magic strings and numbers.
 
 ## 4. Code Quality & Formatting
-- **Imports:** Prefer absolute imports (`from src.domain.models import User`) over relative imports (`from .models import User`).
+- **Imports:** Absolute imports from the package root (`from app.billing.domain import Invoice`), never `from src...` or relative imports.
 - **Typing:** 100% type-hint coverage. Avoid `Any`. Prefer `Sequence`/`Mapping` for parameters and concrete types for return values.
 - **Functions:** Guard clauses and early returns; maximum nesting depth of 3. Keep functions under 40 lines.
 - **Naming:** `snake_case` functions/variables/modules, `PascalCase` classes/Protocols, `UPPER_SNAKE_CASE` constants. Booleans use `is_`, `has_`, `should_`, `can_`.
 - **Formatting:** Use f-strings for string interpolation, but extract complex expressions or function calls into variables before the f-string.
-- **Anti-patterns:** NEVER use mutable default arguments (`def foo(x: list = [])`). No wildcard imports. No circular imports. 
+- **Anti-patterns:** NEVER use mutable default arguments (`def foo(x: list = [])`). No wildcard imports. No circular imports.
 
 ## 5. Error Handling
 - Define a custom domain exception hierarchy (`DomainError` -> `NotFoundError`, `ConflictError`). Never raise bare `Exception`.
 - Never use bare `except:` or swallow exceptions (`except Exception: pass`). Re-raise with `raise ... from err`.
-- Translate domain errors to HTTP responses only in Presentation, using RFC 9457 Problem Details.
+- Translate domain errors to transport-level responses (HTTP, CLI exit codes, messages) only in Presentation.
 - Use timeouts on every outbound network call; add retries with backoff only for idempotent operations.
 
 ## 6. Configuration & Secrets
@@ -69,7 +72,7 @@ You are an expert Python software architect writing modern Python (3.14+) to str
 ## 9. Data Correctness
 - Money uses `decimal.Decimal`, never `float`.
 - Datetimes are timezone-aware UTC (`datetime.now(UTC)`); convert to local time only in Presentation.
-- Use `uuid.uuid7()` where chronological ordering matters, otherwise `uuid.uuid4()`.
+- Use `uuid.uuid7()` for primary keys and anything where chronological ordering matters, otherwise `uuid.uuid4()`.
 
 ## 10. Performance & Resources
 - Use `slots=True` on dataclasses and `__slots__` on frequently instantiated plain classes.
@@ -77,54 +80,44 @@ You are an expert Python software architect writing modern Python (3.14+) to str
 - `async def` for all network, DB, and file I/O. Never block the event loop; offload with `asyncio.to_thread()` or `ProcessPoolExecutor`.
 - Always use connection pooling; manage resources with context managers (`async with`).
 
-## 11. Database & Migrations
-- SQLAlchemy 2.0 async style with typed `Mapped[...]` columns.
-- Postgres driver: `asyncpg`. Do not use `psycopg2` or `psycopg` 3 (due to LGPL constraints on their C extensions).
-- All schema changes go through Alembic migrations.
-
-## 12. API Design (Presentation)
-- FastAPI with explicit request/response models; never return ORM entities directly.
-- Version APIs (`/api/v1/...`), use consistent pagination, and keep OpenAPI docs accurate.
-- Keep route handlers thin: validate input, pass to an Application service, map the result.
-
-## 13. Testing
-- `pytest` with `pytest-asyncio`; aim for >80% coverage on Domain and Application layers.
+## 11. Testing
+- `pytest` with `pytest-asyncio` (`asyncio_mode = "auto"`); aim for >80% coverage on Domain and Application layers.
 - Arrange-Act-Assert structure.
 - Use fakes/stubs injected via constructors. Do not use `unittest.mock.patch` monkey-patching.
 
-## 14. Documentation
-- Use Google-style docstrings (PEP 257 compliant) for all public modules, classes, and functions.
+## 12. Documentation
+- Use Google-style docstrings (PEP 257): summary on the first line in the imperative mood ("Register", not "Registers"), then `Args:`, `Returns:`, `Raises:`.
+- Document all public modules, classes, and functions.
 - Record significant design decisions as ADRs in `docs/adr/`.
 
-## 15. Licensing (CRITICAL: ZERO COPYLEFT)
-- Allowed dependencies: MIT, Apache-2.0, BSD-2/3-Clause, ISC, PSF, Unlicense.
-- Forbidden: GPL, LGPL, AGPL, SSPL, and any unlicensed package.
+## 13. Licensing (CRITICAL: ZERO COPYLEFT)
+- Allowed: MIT, Apache-2.0, BSD-2/3-Clause, 0BSD, ISC, PSF-2.0, Unlicense, Zlib, CC0-1.0.
+- Forbidden: GPL, LGPL, AGPL, SSPL, MPL (including MPL-2.0), and any package with no license.
+- `OR` licenses are allowed if any option is allowed; `AND` licenses require every part to be allowed.
+- The policy covers transitive dependencies. `certifi` is MPL-2.0, so `httpx`, `requests`, and `fastapi[standard]` are excluded; use `aiohttp` (Apache-2.0) for outbound HTTP.
 - When suggesting any third-party package, explicitly state its license to confirm compliance.
 
-## 16. Tooling & Supply Chain
-- `uv` for ultra-fast dependency management and virtual environments; commit `uv.lock`.
-- `ruff check` (including `B`, `SIM`, `I`, `UP`, `S`, `RUF`) and `ruff format` must pass.
+## 14. Tooling & Supply Chain
+- `uv` for dependency management and virtual environments; commit `uv.lock`.
+- `ruff check` (including `B`, `SIM`, `I`, `UP`, `S`, `RUF`; ignore `S101` under `tests/`) and `ruff format` must pass.
 - `mypy --strict` or `pyright` strict mode must pass.
-- CI runs lint, type check, tests, `pip-audit` for vulnerabilities, and `pip-licenses` for license checks.
+- CI runs lint, type check, tests, `pip-audit` for vulnerabilities, and `pip-licenses --partial-match --fail-on="GPL;SSPL;Mozilla;MPL-2.0"` for licenses (bare `MPL` would also match "Simplified BSD").
+- After editing code, run `uv run ruff check --fix`, `uv run ruff format`, `uv run pyright`, and `uv run pytest`, and fix any failures before finishing.
 
 ## Example Output Standard
+
+`src/app/customers/domain.py`:
 ```python
-from __future__ import annotations
-
-import asyncio
-from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, override
-from uuid import UUID, uuid4
-
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from uuid import UUID
 
 type CustomerId = UUID
 
 
-# Domain model (Pure Python, no framework dependencies)
 @dataclass(frozen=True, slots=True)
 class Customer:
+    """A registered customer."""
+
     id: CustomerId
     email: str
     age: int
@@ -136,61 +129,104 @@ class DomainError(Exception):
 
 class CustomerRestrictedError(DomainError):
     """Raised when a customer violates a domain eligibility rule."""
+```
+
+`src/app/customers/services.py`:
+```python
+from types import TracebackType
+from typing import Protocol, Self
+from uuid import uuid7
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+from app.customers.domain import Customer, CustomerId, CustomerRestrictedError
 
 
-# Interface Definition (Structural Subtyping)
 class CustomerRepository(Protocol):
+    """Persistence contract for customers."""
+
     async def get_by_id(self, customer_id: CustomerId) -> Customer | None: ...
-    async def save(self, customer: Customer) -> None: ...
+    async def add(self, customer: Customer) -> None: ...
 
 
-# Inbound DTO (Strict & Immutable)
+class UnitOfWork(Protocol):
+    """Transaction boundary; changes persist only on `commit()`."""
+
+    @property
+    def customers(self) -> CustomerRepository: ...
+
+    async def __aenter__(self) -> Self: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None: ...
+    async def commit(self) -> None: ...
+
+
 class RegisterCustomerCommand(BaseModel):
+    """Input for registering a customer."""
+
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
     email: EmailStr = Field(max_length=255)
     age: int = Field(ge=18)
 
 
-# Application Service with Constructor Injection
 class CustomerService:
-    __slots__ = ("_repo",)
+    """Application service for customer registration."""
 
-    def __init__(self, repo: CustomerRepository) -> None:
-        self._repo = repo
+    __slots__ = ("_uow",)
 
-    async def register_many[T: RegisterCustomerCommand](
-        self, commands: Sequence[T]
-    ) -> list[CustomerId]:
-        """
-        Registers multiple customers concurrently.
-        
+    def __init__(self, uow: UnitOfWork) -> None:
+        self._uow = uow
+
+    async def register(self, command: RegisterCustomerCommand) -> CustomerId:
+        """Register a customer in a single transaction.
+
         Args:
-            commands: A sequence of valid customer registration commands.
-            
+            command: A validated registration command.
+
         Returns:
-            A list of generated Customer IDs.
+            The ID of the newly registered customer.
+
+        Raises:
+            CustomerRestrictedError: If the customer violates an eligibility rule.
         """
-        customers = [self._to_domain(cmd) for cmd in commands]
-        
-        async with asyncio.TaskGroup() as tg:
-            for customer in customers:
-                tg.create_task(self._repo.save(customer))
-                
-        return [c.id for c in customers]
+        customer = self._to_domain(command)
+
+        async with self._uow:
+            await self._uow.customers.add(customer)
+            await self._uow.commit()
+
+        return customer.id
 
     @staticmethod
-    def _to_domain(cmd: RegisterCustomerCommand) -> Customer:
-        is_restricted_domain = cmd.email.endswith("@baddomain.com")
-        
-        if is_restricted_domain and cmd.age < 21:
+    def _to_domain(command: RegisterCustomerCommand) -> Customer:
+        is_restricted_domain = command.email.endswith("@baddomain.com")
+
+        if is_restricted_domain and command.age < 21:
             raise CustomerRestrictedError("Restricted domain requires age 21+")
-            
-        return Customer(id=uuid4(), email=cmd.email, age=cmd.age)
+
+        return Customer(id=uuid7(), email=command.email, age=command.age)
+```
+
+`tests/customers/test_services.py`:
+```python
+from types import TracebackType
+from typing import Self, override
+
+from app.customers.domain import Customer, CustomerId
+from app.customers.services import (
+    CustomerRepository,
+    CustomerService,
+    RegisterCustomerCommand,
+    UnitOfWork,
+)
 
 
-# Test Fake Implementation
-class InMemoryCustomerRepository:
+class InMemoryCustomerRepository(CustomerRepository):
     def __init__(self) -> None:
         self._items: dict[CustomerId, Customer] = {}
 
@@ -199,6 +235,48 @@ class InMemoryCustomerRepository:
         return self._items.get(customer_id)
 
     @override
-    async def save(self, customer: Customer) -> None:
+    async def add(self, customer: Customer) -> None:
         self._items[customer.id] = customer
+
+
+class InMemoryUnitOfWork(UnitOfWork):
+    def __init__(self) -> None:
+        self._customers = InMemoryCustomerRepository()
+        self.is_committed = False
+
+    @property
+    @override
+    def customers(self) -> CustomerRepository:
+        return self._customers
+
+    @override
+    async def __aenter__(self) -> Self:
+        return self
+
+    @override
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        return None
+
+    @override
+    async def commit(self) -> None:
+        self.is_committed = True
+
+
+async def test_register_persists_and_commits_customer() -> None:
+    # Arrange
+    uow = InMemoryUnitOfWork()
+    service = CustomerService(uow)
+    command = RegisterCustomerCommand(email="ada@example.com", age=30)
+
+    # Act
+    customer_id = await service.register(command)
+
+    # Assert
+    assert uow.is_committed
+    assert await uow.customers.get_by_id(customer_id) is not None
 ```
