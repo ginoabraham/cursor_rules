@@ -12,7 +12,7 @@ For FastAPI, SQLAlchemy, asyncpg, or Alembic work, also apply the `python-fastap
 ## 0. Baseline
 - Target Python 3.14 or newer: `requires-python = ">=3.14"` in `pyproject.toml`.
 - Use the `src/` layout with a single `pyproject.toml` as the source of truth for dependencies and tool config.
-- Python 3.14+ free-threaded (No-GIL) builds should be utilized for CPU-bound workloads, provided all C-extension dependencies are verified to support it.
+- The free-threaded (No-GIL) build may be used for CPU-bound, multi-threaded workloads if all C-extension dependencies support it. It is opt-in and slower for single-threaded code, so do not require or suggest it by default.
 
 ## 1. Architecture & Domain-Driven Design
 - **Clean Architecture:** Layers are Domain, Application, Infrastructure, Presentation. Dependencies point inward only. Domain never imports ORMs, web frameworks, or I/O libraries.
